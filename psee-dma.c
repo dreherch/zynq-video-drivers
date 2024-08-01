@@ -22,26 +22,38 @@
 #include "psee-composite.h"
 #include "psee-format.h"
 
-#define PSEE_DMA_DEF_WIDTH		1280
-#define PSEE_DMA_DEF_HEIGHT		720
-
-/* Minimum and maximum widths are expressed in bytes */
-#define PSEE_DMA_MIN_WIDTH		1U
-#define PSEE_DMA_MAX_WIDTH		65535U
-#define PSEE_DMA_MIN_HEIGHT		1U
-#define PSEE_DMA_MAX_HEIGHT		8191U
-
 #define DEFAULT_PACKET_LENGTH		(1 << 20)
 
-#define REG_PACKETIZER_VERSION		(0x0)
-#define REG_PACKETIZER_CONTROL		(0x4)
-#define ENABLE_COUNTER_PATTERN		BIT(0)
-#define ENABLE_TLAST_TIMEOUT		BIT(1)
-#define CLEAR				BIT(2)
-#define REG_PACKETIZER_PACKET_LENGTH	(0x8)
-#define REG_PACKETIZER_TLAST_TIMEOUT	(0xC)
-#define REG_PACKETIZER_TLAST_TIMEOUT_EVT_MSB	(0x10)
-#define REG_PACKETIZER_TLAST_TIMEOUT_EVT_LSB	(0x14)
+#define DEFAULT_MARKER  0xE019E019E019E019
+
+#define REG_CONTROL (0x0)
+union global_ctrl {
+	struct {
+		u32 enable:1;
+		u32 reset:1;
+		u32 clear:1;
+		u32:29;
+	};
+	u32 raw;
+};
+
+#define REG_CONFIG (0x4)
+union global_cfg {
+	struct {
+		u32:1;
+		u32 enable_pattern:1;
+		u32 enable_tlast_timeout:1;
+		u32:29;
+	};
+	u32 raw;
+};
+
+#define REG_VERSION (0x10)
+
+#define REG_PACKET_LENGTH		(0x14)
+#define REG_TLAST_TIMEOUT		(0x18)
+#define REG_TLAST_TIMEOUT_EVT_LSB	(0x20)
+#define REG_TLAST_TIMEOUT_EVT_MSB	(0x24)
 
 /* V4L2 Control codes */
 #define V4L2_CID_XFER_TIMEOUT_ENABLE	(V4L2_CID_USER_BASE | 0x1001)
@@ -57,6 +69,16 @@ static inline u32 read_reg(struct psee_dma *dma, u32 addr)
 static inline void write_reg(struct psee_dma *dma, u32 addr, u32 value)
 {
 	iowrite32(value, dma->iomem + addr);
+}
+
+static inline u64 read_reg64(struct psee_dma *dma, u32 addr)
+{
+	return ioread64(dma->iomem + addr);
+}
+
+static inline void write_reg64(struct psee_dma *dma, u32 addr, u64 value)
+{
+	iowrite64(value, dma->iomem + addr);
 }
 
 /* -----------------------------------------------------------------------------
@@ -88,7 +110,7 @@ static u32 mediabus_to_pixel(unsigned int code)
 }
 
 static struct v4l2_subdev *
-psee_dma_remote_subdev(struct media_pad *local, u32 *pad)
+remote_subdev(struct media_pad *local, u32 *pad)
 {
 	struct media_pad *remote;
 
@@ -102,7 +124,7 @@ psee_dma_remote_subdev(struct media_pad *local, u32 *pad)
 	return media_entity_to_v4l2_subdev(remote->entity);
 }
 
-static int psee_dma_verify_format(struct psee_dma *dma)
+static int verify_format(struct psee_dma *dma)
 {
 	struct v4l2_subdev_format fmt = {
 		.which = V4L2_SUBDEV_FORMAT_ACTIVE,
@@ -110,7 +132,7 @@ static int psee_dma_verify_format(struct psee_dma *dma)
 	struct v4l2_subdev *subdev;
 
 	/* We don't store format, the link shall just be up */
-	subdev = psee_dma_remote_subdev(&dma->pad, &fmt.pad);
+	subdev = remote_subdev(&dma->pad, &fmt.pad);
 	if (subdev == NULL)
 		return -EPIPE;
 
@@ -348,11 +370,12 @@ static void psee_dma_complete(void *param, const struct dmaengine_result *result
 	buf->buf.vb2_buf.timestamp = ktime_get_ns();
 	vb2_set_plane_payload(&buf->buf.vb2_buf, 0, dma->transfer_size - result->residue);
 	vb2_buffer_done(&buf->buf.vb2_buf,
-		result->result == DMA_TRANS_NOERROR ? VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR);
+		result->result == DMA_TRANS_NOERROR ?
+			VB2_BUF_STATE_DONE : VB2_BUF_STATE_ERROR);
 }
 
 static int
-psee_dma_queue_setup(struct vb2_queue *vq,
+queue_setup(struct vb2_queue *vq,
 		     unsigned int *nbuffers, unsigned int *nplanes,
 		     unsigned int sizes[], struct device *alloc_devs[])
 {
@@ -368,7 +391,7 @@ psee_dma_queue_setup(struct vb2_queue *vq,
 	return 0;
 }
 
-static int psee_dma_buffer_prepare(struct vb2_buffer *vb)
+static int buffer_prepare(struct vb2_buffer *vb)
 {
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct psee_dma *dma = vb2_get_drv_priv(vb->vb2_queue);
@@ -379,7 +402,7 @@ static int psee_dma_buffer_prepare(struct vb2_buffer *vb)
 	return 0;
 }
 
-static void psee_dma_buffer_queue(struct vb2_buffer *vb)
+static void buffer_queue(struct vb2_buffer *vb)
 {
 	struct vb2_v4l2_buffer *vbuf = to_vb2_v4l2_buffer(vb);
 	struct psee_dma *dma = vb2_get_drv_priv(vb->vb2_queue);
@@ -420,12 +443,13 @@ static void psee_dma_buffer_queue(struct vb2_buffer *vb)
 		dma_async_issue_pending(dma->dma);
 }
 
-static int psee_dma_start_streaming(struct vb2_queue *vq, unsigned int count)
+static int start_streaming(struct vb2_queue *vq, unsigned int count)
 {
 	struct psee_dma *dma = vb2_get_drv_priv(vq);
 	struct psee_dma_buffer *buf, *nbuf;
 	struct psee_pipeline *pipe;
 	int ret;
+	union global_ctrl control;
 
 	dma->sequence = 0;
 
@@ -446,7 +470,7 @@ static int psee_dma_start_streaming(struct vb2_queue *vq, unsigned int count)
 	/* Verify that the configured format matches the output of the
 	 * connected subdev.
 	 */
-	ret = psee_dma_verify_format(dma);
+	ret = verify_format(dma);
 	if (ret < 0)
 		goto error_stop;
 
@@ -465,6 +489,10 @@ static int psee_dma_start_streaming(struct vb2_queue *vq, unsigned int count)
 	/* Start the pipeline. */
 	psee_pipeline_set_stream(pipe, true);
 
+	/* Enable the packetizer */
+	control = (union global_ctrl){ .enable = 1 };
+	write_reg(dma, REG_CONTROL, control.raw);
+
 	return 0;
 
 error_stop:
@@ -482,17 +510,18 @@ error:
 	return ret;
 }
 
-static void psee_dma_stop_streaming(struct vb2_queue *vq)
+static void stop_streaming(struct vb2_queue *vq)
 {
 	struct psee_dma *dma = vb2_get_drv_priv(vq);
 	struct psee_pipeline *pipe = to_psee_pipeline(&dma->video.entity);
 	struct psee_dma_buffer *buf, *nbuf;
+	union global_ctrl control = { .enable = 0, .clear = 1 };
 
 	/* Stop the pipeline. */
 	psee_pipeline_set_stream(pipe, false);
 
 	/* Disable packetizer and clear its memories */
-	write_reg(dma, REG_PACKETIZER_CONTROL, CLEAR);
+	write_reg(dma, REG_CONTROL, control.raw);
 
 	/* Stop and reset the DMA engine. */
 	dmaengine_terminate_all(dma->dma);
@@ -510,14 +539,14 @@ static void psee_dma_stop_streaming(struct vb2_queue *vq)
 	spin_unlock_irq(&dma->queued_lock);
 }
 
-static const struct vb2_ops psee_dma_queue_qops = {
-	.queue_setup = psee_dma_queue_setup,
-	.buf_prepare = psee_dma_buffer_prepare,
-	.buf_queue = psee_dma_buffer_queue,
+static const struct vb2_ops queue_qops = {
+	.queue_setup = queue_setup,
+	.buf_prepare = buffer_prepare,
+	.buf_queue = buffer_queue,
 	.wait_prepare = vb2_ops_wait_prepare,
 	.wait_finish = vb2_ops_wait_finish,
-	.start_streaming = psee_dma_start_streaming,
-	.stop_streaming = psee_dma_stop_streaming,
+	.start_streaming = start_streaming,
+	.stop_streaming = stop_streaming,
 };
 
 /* -----------------------------------------------------------------------------
@@ -525,7 +554,7 @@ static const struct vb2_ops psee_dma_queue_qops = {
  */
 
 static int
-psee_dma_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
+querycap(struct file *file, void *fh, struct v4l2_capability *cap)
 {
 	struct v4l2_fh *vfh = file->private_data;
 	struct psee_dma *dma = to_psee_dma(vfh->vdev);
@@ -542,7 +571,7 @@ psee_dma_querycap(struct file *file, void *fh, struct v4l2_capability *cap)
 }
 
 static int
-__psee_dma_get_format(struct psee_dma *dma, struct v4l2_pix_format *pix)
+__get_format(struct psee_dma *dma, struct v4l2_pix_format *pix)
 {
 	/* This IP does no format conversion, whatever is requested, output
 	 * will be the same as the input
@@ -553,7 +582,7 @@ __psee_dma_get_format(struct psee_dma *dma, struct v4l2_pix_format *pix)
 	struct v4l2_subdev *subdev;
 	int ret;
 
-	subdev = psee_dma_remote_subdev(&dma->pad, &fmt.pad);
+	subdev = remote_subdev(&dma->pad, &fmt.pad);
 	if (subdev == NULL)
 		return -EPIPE;
 
@@ -582,7 +611,7 @@ __psee_dma_get_format(struct psee_dma *dma, struct v4l2_pix_format *pix)
 }
 
 static int
-psee_dma_enum_format(struct file *file, void *fh, struct v4l2_fmtdesc *f)
+enum_format(struct file *file, void *fh, struct v4l2_fmtdesc *f)
 {
 	struct v4l2_fh *vfh = file->private_data;
 	struct psee_dma *dma = to_psee_dma(vfh->vdev);
@@ -593,49 +622,83 @@ psee_dma_enum_format(struct file *file, void *fh, struct v4l2_fmtdesc *f)
 	if (f->index != 0)
 		return -EINVAL;
 
-	ret = __psee_dma_get_format(dma, &pix);
+	ret = __get_format(dma, &pix);
 	f->pixelformat = pix.pixelformat;
 
 	return ret;
 }
 
 static int
-psee_dma_get_format(struct file *file, void *fh, struct v4l2_format *format)
+get_format(struct file *file, void *fh, struct v4l2_format *format)
 {
 	struct v4l2_fh *vfh = file->private_data;
 	struct psee_dma *dma = to_psee_dma(vfh->vdev);
 
-	return __psee_dma_get_format(dma, &format->fmt.pix);
+	return __get_format(dma, &format->fmt.pix);
 }
 
 static int
-psee_dma_try_format(struct file *file, void *fh, struct v4l2_format *format)
+try_format(struct file *file, void *fh, struct v4l2_format *format)
 {
 	struct v4l2_fh *vfh = file->private_data;
 	struct psee_dma *dma = to_psee_dma(vfh->vdev);
 
-	return __psee_dma_get_format(dma, &format->fmt.pix);
+	return __get_format(dma, &format->fmt.pix);
 }
 
 static int
-psee_dma_set_format(struct file *file, void *fh, struct v4l2_format *format)
+set_format(struct file *file, void *fh, struct v4l2_format *format)
 {
 	struct v4l2_fh *vfh = file->private_data;
 	struct psee_dma *dma = to_psee_dma(vfh->vdev);
+	union global_cfg config;
 
 	if (vb2_is_busy(&dma->queue))
 		return -EBUSY;
 
 	/* Make sure counter pattern is disabled */
-	write_reg(dma, REG_PACKETIZER_CONTROL, 0);
+	config.raw = read_reg(dma, REG_CONFIG);
+	config.enable_pattern = 0;
+	write_reg(dma, REG_CONFIG, config.raw);
 	/* Set packet size to image size in bus words */
-	write_reg(dma, REG_PACKETIZER_PACKET_LENGTH, dma->transfer_size / 8);
+	write_reg(dma, REG_PACKET_LENGTH, dma->transfer_size / 8);
 
-	return __psee_dma_get_format(dma, &format->fmt.pix);
+	return __get_format(dma, &format->fmt.pix);
+}
+
+/*
+ * V4L2 debug Operations
+ */
+static int log_status(struct file *file, void *fh)
+{
+	struct v4l2_fh *vfh = file->private_data;
+	struct psee_dma *dma = to_psee_dma(vfh->vdev);
+	struct device *dev = dmaengine_get_dma_device(dma->dma);
+	union global_ctrl control;
+	union global_cfg config;
+	u32 version;
+
+	control.raw = read_reg(dma, REG_CONTROL);
+	config.raw = read_reg(dma, REG_CONFIG);
+	version = read_reg(dma, REG_VERSION);
+
+	dev_info(dev, "***** PseeVideo driver *****\n");
+	dev_info(dev, "Version = 0x%x\n", version);
+	dev_info(dev, "Control = %s %s(0x%x)\n",
+		control.enable ? "ENABLED" : "DISABLED",
+		control.clear ? "CLEARING " : "",
+		control.raw);
+	dev_info(dev, "Config = %s%s(0x%x)\n",
+		config.enable_pattern ? "PATTERN " : "",
+		config.enable_tlast_timeout ? "TIMEOUT " : "",
+		config.raw);
+
+	dev_info(dev, "I/O space = 0x%llx\n", dma->iosize);
+	return 0;
 }
 
 #ifdef CONFIG_VIDEO_ADV_DEBUG
-static int psee_dma_g_register(struct file *file, void *fh, struct v4l2_dbg_register *reg)
+static int g_register(struct file *file, void *fh, struct v4l2_dbg_register *reg)
 {
 	struct psee_dma *dev = video_drvdata(file);
 
@@ -655,7 +718,7 @@ static int psee_dma_g_register(struct file *file, void *fh, struct v4l2_dbg_regi
 	return 0;
 }
 
-static int psee_dma_s_register(struct file *file, void *fh, const struct v4l2_dbg_register *reg)
+static int s_register(struct file *file, void *fh, const struct v4l2_dbg_register *reg)
 {
 	struct psee_dma *dev = video_drvdata(file);
 
@@ -674,7 +737,7 @@ static int psee_dma_s_register(struct file *file, void *fh, const struct v4l2_db
 	return 0;
 }
 
-static int psee_dma_g_chip_info(struct file *file, void *fh, struct v4l2_dbg_chip_info *chip)
+static int g_chip_info(struct file *file, void *fh, struct v4l2_dbg_chip_info *chip)
 {
 	struct psee_dma *dev = video_drvdata(file);
 
@@ -685,12 +748,12 @@ static int psee_dma_g_chip_info(struct file *file, void *fh, struct v4l2_dbg_chi
 }
 #endif
 
-static const struct v4l2_ioctl_ops psee_dma_ioctl_ops = {
-	.vidioc_querycap		= psee_dma_querycap,
-	.vidioc_enum_fmt_vid_cap	= psee_dma_enum_format,
-	.vidioc_g_fmt_vid_cap		= psee_dma_get_format,
-	.vidioc_s_fmt_vid_cap		= psee_dma_set_format,
-	.vidioc_try_fmt_vid_cap		= psee_dma_try_format,
+static const struct v4l2_ioctl_ops ioctl_ops = {
+	.vidioc_querycap		= querycap,
+	.vidioc_enum_fmt_vid_cap	= enum_format,
+	.vidioc_g_fmt_vid_cap		= get_format,
+	.vidioc_s_fmt_vid_cap		= set_format,
+	.vidioc_try_fmt_vid_cap		= try_format,
 	.vidioc_reqbufs			= vb2_ioctl_reqbufs,
 	.vidioc_querybuf		= vb2_ioctl_querybuf,
 	.vidioc_qbuf			= vb2_ioctl_qbuf,
@@ -699,10 +762,11 @@ static const struct v4l2_ioctl_ops psee_dma_ioctl_ops = {
 	.vidioc_expbuf			= vb2_ioctl_expbuf,
 	.vidioc_streamon		= vb2_ioctl_streamon,
 	.vidioc_streamoff		= vb2_ioctl_streamoff,
+	.vidioc_log_status		= log_status,
 #ifdef CONFIG_VIDEO_ADV_DEBUG
-	.vidioc_g_register		= psee_dma_g_register,
-	.vidioc_s_register		= psee_dma_s_register,
-	.vidioc_g_chip_info		= psee_dma_g_chip_info,
+	.vidioc_g_register		= g_register,
+	.vidioc_s_register		= s_register,
+	.vidioc_g_chip_info		= g_chip_info,
 #endif
 };
 
@@ -710,7 +774,7 @@ static const struct v4l2_ioctl_ops psee_dma_ioctl_ops = {
  * V4L2 file operations
  */
 
-static const struct v4l2_file_operations psee_dma_fops = {
+static const struct v4l2_file_operations fops = {
 	.owner		= THIS_MODULE,
 	.unlocked_ioctl	= video_ioctl2,
 	.open		= v4l2_fh_open,
@@ -725,14 +789,12 @@ static const struct v4l2_file_operations psee_dma_fops = {
 static int timeout_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct psee_dma *dma = ctrl->priv;
-	u32 val;
+	union global_cfg config = { .raw = read_reg(dma, REG_CONFIG) };
 
 	switch (ctrl->id) {
 	case V4L2_CID_XFER_TIMEOUT_ENABLE:
-		val = read_reg(dma, REG_PACKETIZER_CONTROL);
-		val &= ~ENABLE_TLAST_TIMEOUT;
-		val |= (ctrl->val ? ENABLE_TLAST_TIMEOUT : 0);
-		write_reg(dma, REG_PACKETIZER_CONTROL, val);
+		config.enable_tlast_timeout = ctrl->val;
+		write_reg(dma, REG_CONFIG, config.raw);
 		return 0;
 	default:
 		return -EINVAL;
@@ -765,6 +827,7 @@ int psee_dma_init(struct psee_composite_device *psee_dev, struct psee_dma *dma,
 	int ret;
 	struct device *dev = psee_dev->dev;
 	struct v4l2_ctrl_handler *ctrl_hdr;
+	union global_ctrl control = { 0 };
 
 	dma->psee_dev = psee_dev;
 	dma->port = port;
@@ -773,7 +836,7 @@ int psee_dma_init(struct psee_composite_device *psee_dev, struct psee_dma *dma,
 	INIT_LIST_HEAD(&dma->queued_bufs);
 	spin_lock_init(&dma->queued_lock);
 
-	/* This is hard-coded for now, te be re-evaluated when supporting planar-formats */
+	/* This is hard-coded for now, to be re-evaluated when supporting planar-formats */
 	dma->transfer_size = DEFAULT_PACKET_LENGTH;
 
 	/* Initialize the media entity... */
@@ -785,7 +848,7 @@ int psee_dma_init(struct psee_composite_device *psee_dev, struct psee_dma *dma,
 		goto error;
 
 	/* ... and the video node... */
-	dma->video.fops = &psee_dma_fops;
+	dma->video.fops = &fops;
 	dma->video.v4l2_dev = &psee_dev->v4l2_dev;
 	dma->video.queue = &dma->queue;
 	snprintf(dma->video.name, sizeof(dma->video.name), "%pOFn %s %u",
@@ -796,7 +859,7 @@ int psee_dma_init(struct psee_composite_device *psee_dev, struct psee_dma *dma,
 	dma->video.vfl_dir = type == V4L2_BUF_TYPE_VIDEO_CAPTURE
 			   ? VFL_DIR_RX : VFL_DIR_TX;
 	dma->video.release = video_device_release_empty;
-	dma->video.ioctl_ops = &psee_dma_ioctl_ops;
+	dma->video.ioctl_ops = &ioctl_ops;
 	dma->video.lock = &dma->lock;
 	dma->video.device_caps = V4L2_CAP_STREAMING;
 	if (type == V4L2_BUF_TYPE_VIDEO_CAPTURE)
@@ -819,7 +882,7 @@ int psee_dma_init(struct psee_composite_device *psee_dev, struct psee_dma *dma,
 	dma->queue.lock = &dma->lock;
 	dma->queue.drv_priv = dma;
 	dma->queue.buf_struct_size = sizeof(struct psee_dma_buffer);
-	dma->queue.ops = &psee_dma_queue_qops;
+	dma->queue.ops = &queue_qops;
 	dma->queue.mem_ops = &vb2_dma_contig_memops;
 	dma->queue.timestamp_flags = V4L2_BUF_FLAG_TIMESTAMP_MONOTONIC
 				   | V4L2_BUF_FLAG_TSTAMP_SRC_EOF;
@@ -849,10 +912,11 @@ int psee_dma_init(struct psee_composite_device *psee_dev, struct psee_dma *dma,
 	}
 	dma->iosize = resource_size(io_space);
 
-	/* Make sure counter pattern is disabled */
-	write_reg(dma, REG_PACKETIZER_CONTROL, 0);
+	/* Reset the RTL */
+	control.reset = 1;
+	write_reg(dma, REG_CONTROL, control.raw);
 	/* Set packet size to image size in bus words */
-	write_reg(dma, REG_PACKETIZER_PACKET_LENGTH, dma->transfer_size / 8);
+	write_reg(dma, REG_PACKET_LENGTH, dma->transfer_size / 8);
 
 	/* Initialize the V4L2-ctl handler to tune the behavior */
 	dma->video.ctrl_handler =
@@ -865,15 +929,11 @@ int psee_dma_init(struct psee_composite_device *psee_dev, struct psee_dma *dma,
 	}
 	v4l2_ctrl_handler_init(ctrl_hdr, 3);
 
-	/* Set the features of the V2 IP */
-	if ((read_reg(dma, REG_PACKETIZER_VERSION) & ~0xFFFF) == 0x20000) {
-		/* Set a timeout symbol that works in both EVT21 and EVT3 */
-		write_reg(dma, REG_PACKETIZER_TLAST_TIMEOUT_EVT_LSB, 0xE019E019);
-		write_reg(dma, REG_PACKETIZER_TLAST_TIMEOUT_EVT_MSB, 0xE019E019);
+	/* Set a timeout symbol that works in both EVT21 and EVT3 */
+	write_reg64(dma, REG_TLAST_TIMEOUT_EVT_LSB, DEFAULT_MARKER);
 
-		/* Register a control to enable/disable timeout on transfers */
-		v4l2_ctrl_new_custom(ctrl_hdr, &timeout_enable_control, dma);
-	}
+	/* Register a control to enable/disable timeout on transfers */
+	v4l2_ctrl_new_custom(ctrl_hdr, &timeout_enable_control, dma);
 
 	ret = ctrl_hdr->error;
 	if (ret < 0) {
