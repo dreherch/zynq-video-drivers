@@ -19,15 +19,30 @@
 #define PAD_SINK 0
 #define PAD_SOURCE 1
 
-#define REG_VERSION		(0x0)
 
-#define REG_CONTROL		(0x4)
-#define BIT_ENABLE		BIT(0)
-#define BIT_BYPASS		BIT(1)
-#define BIT_CLEAR		BIT(2)
+#define REG_CONTROL (0x0)
+union global_ctrl {
+	struct {
+		u32 enable:1;
+		u32 reset:1;
+		u32 clear:1;
+		u32:29;
+	};
+	u32 raw;
+};
 
-#define REG_CONFIG		(0x8)
-#define WORD_ORDER_SWAP		BIT(0)
+#define REG_CONFIG (0x4)
+union global_cfg {
+	struct {
+		u32 bypass:1;
+		u32:1;
+		u32 word_order_swap:1;
+		u32:29;
+	};
+	u32 raw;
+};
+
+#define REG_VERSION (0x10)
 
 /**
  * struct psee_tkhdlr - Prophesee generic structure of a streaming IP
@@ -73,17 +88,17 @@ static inline void write_reg(struct psee_tkhdlr *tkhdlr, u32 addr, u32 value)
 static int s_stream(struct v4l2_subdev *subdev, int enable)
 {
 	struct psee_tkhdlr *tkhdlr = to_tkhdlr(subdev);
-	u32 control = read_reg(tkhdlr, REG_CONTROL);
+	union global_ctrl control = { .raw = 0 };
 
 	if (!enable) {
-		control &= ~BIT_ENABLE;
-		control |= BIT_CLEAR;
+		control.enable = 0;
+		control.clear = 1;
 	} else {
-		control &= ~BIT_CLEAR;
-		control |= BIT_ENABLE;
+		control.clear = 0;
+		control.enable = 1;
 	}
 
-	write_reg(tkhdlr, REG_CONTROL, control);
+	write_reg(tkhdlr, REG_CONTROL, control.raw);
 
 	return 0;
 }
@@ -148,26 +163,28 @@ static int set_format(struct v4l2_subdev *subdev, struct v4l2_subdev_state *sd_s
 {
 	struct psee_tkhdlr *tkhdlr = to_tkhdlr(subdev);
 	struct v4l2_mbus_framefmt *format;
+	union global_cfg config;
 
 	format = __get_pad_format(tkhdlr, sd_state, fmt->pad, fmt->which);
 	if (!format)
 		return -EINVAL;
 
-	if (fmt->pad == PAD_SINK) {
-		u32 config = read_reg(tkhdlr, REG_CONFIG);
+	config.raw = read_reg(tkhdlr, REG_CONFIG);
 
+	if (fmt->pad == PAD_SINK) {
 		/* Save the new format */
 		*format = fmt->format;
 		/* Propagate the format to the source pad */
 		format = __get_pad_format(tkhdlr, sd_state, PAD_SOURCE, fmt->which);
 		*format = fmt->format;
 		if ((fmt->format.code == MEDIA_BUS_FMT_PSEE_EVT21ME) &&
-			(config & WORD_ORDER_SWAP)) {
+			(config.word_order_swap)) {
 			/* The IP is set to convert EVT21ME into actual EVT21 */
 			format->code = MEDIA_BUS_FMT_PSEE_EVT21;
 		} else {
 			/* In any other case, leave the data as-is */
-			write_reg(tkhdlr, REG_CONFIG, 0);
+			config.word_order_swap = 0;
+			write_reg(tkhdlr, REG_CONFIG, config.raw);
 		}
 	} else {
 		struct v4l2_mbus_framefmt *input_format;
@@ -178,11 +195,13 @@ static int set_format(struct v4l2_subdev *subdev, struct v4l2_subdev_state *sd_s
 		if ((input_format->code == MEDIA_BUS_FMT_PSEE_EVT21ME) &&
 			(fmt->format.code == MEDIA_BUS_FMT_PSEE_EVT21)) {
 			/* Swap the word order to get straight EVT2.1 */
-			write_reg(tkhdlr, REG_CONFIG, WORD_ORDER_SWAP);
+			config.word_order_swap = 1;
+			write_reg(tkhdlr, REG_CONFIG, config.raw);
 			format->code = MEDIA_BUS_FMT_PSEE_EVT21;
 		} else {
 			/* Don't alter the input data */
-			write_reg(tkhdlr, REG_CONFIG, 0);
+			config.word_order_swap = 0;
+			write_reg(tkhdlr, REG_CONFIG, config.raw);
 		}
 		/* Let the userspace know about it */
 		fmt->format = *format;
@@ -198,16 +217,26 @@ static int log_status(struct v4l2_subdev *sd)
 {
 	struct psee_tkhdlr *tkhdlr = to_tkhdlr(sd);
 	struct device *dev = tkhdlr->dev;
-	u32 control = read_reg(tkhdlr, REG_CONTROL);
+	union global_ctrl control;
+	union global_cfg config;
+	u32 version;
 
-	dev_info(dev, "***** Tkeep driver *****\n");
-	dev_info(dev, "Version = 0x%x\n", read_reg(tkhdlr, REG_VERSION));
-	dev_info(dev, "Control = %s %s %s(0x%x)\n",
-		control & BIT_ENABLE ? "ENABLED" : "DISABLED",
-		control & BIT_BYPASS ? "BYPASSED" : "ENGAGED",
-		control & BIT_CLEAR ? "CLEARING " : "",
-		control);
-	dev_info(dev, "Config = 0x%x\n", read_reg(tkhdlr, REG_CONFIG));
+	control.raw = read_reg(tkhdlr, REG_CONTROL);
+	config.raw = read_reg(tkhdlr, REG_CONFIG);
+	version = read_reg(tkhdlr, REG_VERSION);
+
+	dev_info(dev, "***** Tkeep Handler Driver *****\n");
+	dev_info(dev, "Version = 0x%x\n", version);
+	dev_info(dev, "Control = %s %s(0x%x)\n",
+		control.enable ? "ENABLED" : "DISABLED",
+		control.clear ? "CLEARING " : "",
+		control.raw);
+	dev_info(dev, "Config = %s %s(0x%x)\n",
+		config.bypass ? "BYPASSED" : "USED",
+		config.word_order_swap ? "WORD_SWAPPING" : "",
+		config.raw);
+
+	dev_info(dev, "I/O space = 0x%llx\n", tkhdlr->iosize);
 	return 0;
 }
 
@@ -320,6 +349,7 @@ static int probe(struct platform_device *pdev)
 	struct psee_tkhdlr *tkhdlr;
 	struct v4l2_subdev *subdev;
 	struct resource *io_space;
+	union global_ctrl ctrl = { .raw = 0 };
 	int ret;
 
 	tkhdlr = devm_kzalloc(&pdev->dev, sizeof(*tkhdlr), GFP_KERNEL);
@@ -345,8 +375,8 @@ static int probe(struct platform_device *pdev)
 	clk_prepare_enable(tkhdlr->clk);
 
 	/* Reset registers to a known configuration */
-	write_reg(tkhdlr, REG_CONTROL, BIT_CLEAR);
-	write_reg(tkhdlr, REG_CONFIG, 0);
+	ctrl.reset = 1;
+	write_reg(tkhdlr, REG_CONTROL, ctrl.raw);
 
 	/* Initialize V4L2 subdevice and media entity */
 	subdev = &tkhdlr->subdev;
@@ -411,5 +441,5 @@ static struct platform_driver tkeep_driver = {
 
 module_platform_driver(tkeep_driver);
 
-MODULE_DESCRIPTION("Prophesee Tkeep Handler Driver");
+MODULE_DESCRIPTION("Prophesee tkeep Handler Driver");
 MODULE_LICENSE("GPL");
