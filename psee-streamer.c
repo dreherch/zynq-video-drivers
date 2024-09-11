@@ -22,12 +22,28 @@
 #define PAD_SINK 0
 #define PAD_SOURCE 1
 
-#define REG_VERSION		(0x0)
 
-#define REG_CONTROL		(0x4)
-#define BIT_ENABLE		BIT(0)
-#define BIT_BYPASS		BIT(1)
-#define BIT_CLEAR		BIT(2)
+#define REG_CONTROL (0x0)
+union global_ctrl {
+	struct {
+		u32 enable:1;
+		u32 reset:1;
+		u32 clear:1;
+		u32:29;
+	};
+	u32 raw;
+};
+
+#define REG_CONFIG (0x4)
+union global_cfg {
+	struct {
+		u32 bypass:1;
+		u32:31;
+	};
+	u32 raw;
+};
+
+#define REG_VERSION (0x10)
 
 /**
  * struct psee_streamer - Prophesee generic structure of a streaming IP
@@ -73,17 +89,17 @@ static inline void write_reg(struct psee_streamer *streamer, u32 addr, u32 value
 static int s_stream(struct v4l2_subdev *subdev, int enable)
 {
 	struct psee_streamer *streamer = to_streamer(subdev);
-	u32 control = read_reg(streamer, REG_CONTROL);
+	union global_ctrl control = { .raw = 0 };
 
 	if (!enable) {
-		control &= ~BIT_ENABLE;
-		control |= BIT_CLEAR;
+		control.enable = 0;
+		control.clear = 1;
 	} else {
-		control &= ~BIT_CLEAR;
-		control |= BIT_ENABLE;
+		control.clear = 0;
+		control.enable = 1;
 	}
 
-	write_reg(streamer, REG_CONTROL, control);
+	write_reg(streamer, REG_CONTROL, control.raw);
 
 	return 0;
 }
@@ -148,23 +164,26 @@ static int set_format(struct v4l2_subdev *subdev, struct v4l2_subdev_state *sd_s
 {
 	struct psee_streamer *streamer = to_streamer(subdev);
 	struct v4l2_mbus_framefmt *format;
+	union global_cfg config;
 
 	format = __get_pad_format(streamer, sd_state, fmt->pad, fmt->which);
 	if (!format)
 		return -EINVAL;
 
+	config.raw = read_reg(streamer, REG_CONFIG);
+
 	if (fmt->pad == PAD_SINK) {
 		/* Save the new format */
 		*format = fmt->format;
-		/* If the IP is not in bypass, someone tempered it, let that someone deal with the
-		 * format setting and propagation
+		/* If the IP is not in bypass, someone tempered it, let that
+		 * someone deal with the format setting and propagation
 		 */
-		if (read_reg(streamer, REG_CONTROL) & BIT_BYPASS)
+		if (config.bypass)
 			return 0;
 		/* Propagate the format to the source pad */
 		format = __get_pad_format(streamer, sd_state, PAD_SOURCE, fmt->which);
 		*format = fmt->format;
-	} else if ((read_reg(streamer, REG_CONTROL) & BIT_BYPASS)) {
+	} else if (config.bypass) {
 		/* pad is SOURCE and IP is in bypass */
 		struct v4l2_mbus_framefmt *input_format;
 
@@ -174,8 +193,9 @@ static int set_format(struct v4l2_subdev *subdev, struct v4l2_subdev_state *sd_s
 		/* Let the userspace know about it */
 		fmt->format = *input_format;
 	} else {
-		/* Someone with root powers changed the IP configuration, don't try to guess the
-		 * actual output and let the root user deal with the settings
+		/* Someone with root powers changed the IP configuration, don't
+		 * try to guess the actual output and let the root user deal
+		 * with the settings
 		 */
 		*format = fmt->format;
 	}
@@ -190,15 +210,24 @@ static int log_status(struct v4l2_subdev *sd)
 {
 	struct psee_streamer *streamer = to_streamer(sd);
 	struct device *dev = streamer->dev;
-	u32 control = read_reg(streamer, REG_CONTROL);
+	union global_ctrl control;
+	union global_cfg config;
+	u32 version;
+
+	control.raw = read_reg(streamer, REG_CONTROL);
+	config.raw = read_reg(streamer, REG_CONFIG);
+	version = read_reg(streamer, REG_VERSION);
 
 	dev_info(dev, "***** Passthrough driver *****\n");
-	dev_info(dev, "Version = 0x%x\n", read_reg(streamer, REG_VERSION));
-	dev_info(dev, "Control = %s %s %s(0x%x)\n",
-		control & BIT_ENABLE ? "ENABLED" : "DISABLED",
-		control & BIT_BYPASS ? "BYPASSED" : "ENGAGED",
-		control & BIT_CLEAR ? "CLEARING " : "",
-		control);
+	dev_info(dev, "Version = 0x%x\n", version);
+	dev_info(dev, "Control = %s %s(0x%x)\n",
+		control.enable ? "ENABLED" : "DISABLED",
+		control.clear ? "CLEARING " : "",
+		control.raw);
+	dev_info(dev, "Config = %s (0x%x)\n",
+		config.bypass ? "BYPASSED" : "USED",
+		config.raw);
+
 	dev_info(dev, "I/O space = 0x%llx\n", streamer->iosize);
 	return 0;
 }
@@ -312,6 +341,7 @@ static int probe(struct platform_device *pdev)
 	struct psee_streamer *streamer;
 	struct v4l2_subdev *subdev;
 	struct resource *io_space;
+	union global_cfg config = { .bypass = 1 };
 	int ret;
 
 	streamer = devm_kzalloc(&pdev->dev, sizeof(*streamer), GFP_KERNEL);
@@ -345,6 +375,9 @@ static int probe(struct platform_device *pdev)
 	strscpy(subdev->name, dev_name(&pdev->dev), sizeof(subdev->name));
 	v4l2_set_subdevdata(subdev, streamer);
 	subdev->flags |= V4L2_SUBDEV_FL_HAS_DEVNODE;
+
+	/* This is a generic driver for unknown IPs, just bypass the IP */
+	write_reg(streamer, REG_CONFIG, config.raw);
 
 	streamer->pads[PAD_SINK].flags = MEDIA_PAD_FL_SINK;
 	streamer->pads[PAD_SOURCE].flags = MEDIA_PAD_FL_SOURCE;
