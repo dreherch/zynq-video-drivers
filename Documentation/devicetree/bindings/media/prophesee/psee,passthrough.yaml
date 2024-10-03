@@ -24,6 +24,15 @@ properties:
   reg:
     maxItems: 1
 
+  clocks:
+    description: List of clock specifiers
+    items:
+      - description: AXI Stream clock
+
+  clock-names:
+    items:
+      - const: aclk
+
   ports:
     $ref: /schemas/graph.yaml#/properties/ports
 
@@ -43,6 +52,8 @@ properties:
 required:
   - compatible
   - reg
+  - clocks
+  - clock-names
   - ports
 
 additionalProperties: false
@@ -52,6 +63,8 @@ examples:
     tkeep_handler@a0000000 {
         compatible = "psee,passthrough";
         reg = <0xa0000000 0x80>;
+        clock-names = "aclk";
+        clocks = <&zynqmp_clk 71>;
         ports {
             #address-cells = <1>;
             #size-cells = <0>;
