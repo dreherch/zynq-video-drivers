@@ -23,6 +23,15 @@ properties:
   reg:
     maxItems: 1
 
+  clocks:
+    description: List of clock specifiers
+    items:
+      - description: AXI Stream clock
+
+  clock-names:
+    items:
+      - const: aclk
+
   dmas:
     description: |
       List of the DMA channels connected to the Packetizer.
@@ -49,6 +58,8 @@ properties:
 required:
   - compatible
   - reg
+  - clocks
+  - clock-names
   - dmas
   - dma-names
   - ports
@@ -60,6 +71,8 @@ examples:
     event_cap@a0000000 {
         compatible ="psee,axi4s-packetizer";
         reg = <0xa0000000 0x100>;
+        clock-names = "aclk";
+        clocks = <&zynqmp_clk 71>;
         dmas = <&axi_dma 1>;
         dma-names = "port0";
         ports {
