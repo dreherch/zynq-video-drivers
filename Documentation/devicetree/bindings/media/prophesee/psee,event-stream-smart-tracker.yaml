@@ -1,0 +1,91 @@
+# SPDX-License-Identifier: (GPL-2.0-only OR BSD-2-Clause)
+%YAML 1.2
+---
+$id: http://devicetree.org/schemas/media/prophesee/psee,event-stream-smart-tracker.yaml#
+$schema: http://devicetree.org/meta-schemas/core.yaml#
+
+title: Prophesee Event Stream Smart Tracker
+
+maintainers:
+  - Christian Dreher <cdreher@prophesee.ai>
+
+description: |
+  The Event Stream Smart Tracker (ESST) is a soft Prophesee IP core for use
+  with AMD Vivado Design Suite. The ESST IP is used to process event data by
+  - Dropping event when data pipeline is full to prevent backpressure on MIPI RX
+  - Analyse the timestamp and raise flags or drop events when errors/corruptions
+    in data flow occurs
+  - Insert missing TimeHigh (TH) events
+  - Generate custom special event in the flow when any issue occurs in data flow
+  - Provides statistics of missing/dropped events
+
+properties:
+  compatible:
+    enum:
+      - psee,event-stream-smart-tracker
+
+  reg:
+    maxItems: 1
+
+  clocks:
+    description: List of clock specifiers
+    items:
+      - description: AXI Stream clock
+
+  clock-names:
+    items:
+      - const: aclk
+
+  ports:
+    $ref: /schemas/graph.yaml#/properties/ports
+
+    properties:
+      port@0:
+        $ref: /schemas/graph.yaml#/$defs/port-base
+        description: |
+          Input/sink port node, describing the connection to the
+          output of the uphill block in the hardware pipeline.
+
+      port@1:
+        $ref: /schemas/graph.yaml#/$defs/port-base
+        description: |
+          Output/source port node, describing the connection to the
+          input of the downhill block in the hardware pipeline.
+
+required:
+  - compatible
+  - reg
+  - clocks
+  - clock-names
+  - ports
+
+additionalProperties: false
+
+examples:
+  - |
+    tkeep_handler@a0000000 {
+        compatible = "psee,event-stream-smart-tracker";
+        reg = <0xa0000000 0x80>;
+        clock-names = "aclk";
+        clocks = <&zynqmp_clk 71>;
+        ports {
+            #address-cells = <1>;
+            #size-cells = <0>;
+
+            port@0 {
+                /* Sink port */
+                reg = <0>;
+                tkeep_handler_in: endpoint {
+                    remote-endpoint = <&mipi_csirx_out>;
+                };
+            };
+            port@1 {
+                /* Source port */
+                reg = <1>;
+                tkeep_handler_out: endpoint {
+                    remote-endpoint = <&packetizer_in>;
+                };
+            };
+        };
+    };
+...
