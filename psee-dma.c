@@ -57,6 +57,7 @@ union global_cfg {
 
 /* V4L2 Control codes */
 #define V4L2_CID_XFER_TIMEOUT_ENABLE	(V4L2_CID_USER_BASE | 0x1001)
+#define V4L2_CID_XFER_TIMEOUT_THRESHOLD (V4L2_CID_USER_BASE | 0x1002)
 
 /*
  * Register related operations
@@ -790,11 +791,18 @@ static int timeout_s_ctrl(struct v4l2_ctrl *ctrl)
 {
 	struct psee_dma *dma = ctrl->priv;
 	union global_cfg config = { .raw = read_reg(dma, REG_CONFIG) };
+	u64 timeout;
 
 	switch (ctrl->id) {
 	case V4L2_CID_XFER_TIMEOUT_ENABLE:
 		config.enable_tlast_timeout = ctrl->val;
 		write_reg(dma, REG_CONFIG, config.raw);
+		return 0;
+	case V4L2_CID_XFER_TIMEOUT_THRESHOLD:
+		timeout = ctrl->val;
+		timeout *= clk_get_rate(dma->clk);
+		timeout /= 1000000; /* val is in us */
+		write_reg(dma, REG_TLAST_TIMEOUT, timeout);
 		return 0;
 	default:
 		return -EINVAL;
@@ -813,6 +821,17 @@ static const struct v4l2_ctrl_config timeout_enable_control = {
 	.min = false,
 	.max = true,
 	.def = true,
+	.step = 1,
+};
+
+static const struct v4l2_ctrl_config timeout_threshold_control = {
+	.ops = &timeout_ctrl_ops,
+	.id = V4L2_CID_XFER_TIMEOUT_THRESHOLD,
+	.name = "Transfer timeout threshold(us)",
+	.type = V4L2_CTRL_TYPE_INTEGER,
+	.min = 1,
+	.max = 4000000,
+	.def = 10000,
 	.step = 1,
 };
 
@@ -835,6 +854,15 @@ int psee_dma_init(struct psee_composite_device *psee_dev, struct psee_dma *dma,
 	mutex_init(&dma->pipe.lock);
 	INIT_LIST_HEAD(&dma->queued_bufs);
 	spin_lock_init(&dma->queued_lock);
+
+	/* Get the IP clock (not the sensor timebase) */
+	dma->clk = devm_clk_get(dev, NULL);
+	if (IS_ERR(dma->clk)) {
+		ret = PTR_ERR(dma->clk);
+		goto error;
+	}
+	clk_prepare_enable(dma->clk);
+	dev_dbg(dev, "Got clk at %lu", clk_get_rate(dma->clk));
 
 	/* This is hard-coded for now, to be re-evaluated when supporting planar-formats */
 	dma->transfer_size = DEFAULT_PACKET_LENGTH;
@@ -934,6 +962,8 @@ int psee_dma_init(struct psee_composite_device *psee_dev, struct psee_dma *dma,
 
 	/* Register a control to enable/disable timeout on transfers */
 	v4l2_ctrl_new_custom(ctrl_hdr, &timeout_enable_control, dma);
+	/* And one to set the timeout duration */
+	v4l2_ctrl_new_custom(ctrl_hdr, &timeout_threshold_control, dma);
 
 	ret = ctrl_hdr->error;
 	if (ret < 0) {
@@ -966,6 +996,9 @@ void psee_dma_cleanup(struct psee_dma *dma)
 		dma_release_channel(dma->dma);
 
 	media_entity_cleanup(&dma->video.entity);
+
+	if (!IS_ERR(dma->clk))
+		clk_disable_unprepare(dma->clk);
 
 	mutex_destroy(&dma->lock);
 	mutex_destroy(&dma->pipe.lock);

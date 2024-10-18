@@ -12,6 +12,7 @@
 #include <linux/mutex.h>
 #include <linux/spinlock.h>
 #include <linux/videodev2.h>
+#include <linux/clk.h>
 
 #include <media/media-entity.h>
 #include <media/v4l2-dev.h>
@@ -63,6 +64,7 @@ static inline struct psee_pipeline *to_psee_pipeline(struct media_entity *e)
  * @dma: DMA engine channel
  * @iomem: Mapping of the IP registers in the kernel space
  * @iosize: size of the mapped register bank (in byte)
+ * @clk: clock of the video pipeline
  */
 struct psee_dma {
 	struct list_head list;
@@ -85,6 +87,7 @@ struct psee_dma {
 	void __iomem *iomem;
 	resource_size_t iosize;
 	struct dma_chan *dma;
+	struct clk *clk;
 };
 
 #define to_psee_dma(vdev)	container_of(vdev, struct psee_dma, video)
