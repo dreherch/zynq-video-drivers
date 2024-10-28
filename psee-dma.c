@@ -12,6 +12,7 @@
 #include <linux/of.h>
 #include <linux/slab.h>
 
+#include <media/media-entity.h>
 #include <media/v4l2-dev.h>
 #include <media/v4l2-fh.h>
 #include <media/v4l2-ioctl.h>
@@ -21,6 +22,20 @@
 #include "psee-dma.h"
 #include "psee-composite.h"
 #include "psee-format.h"
+
+/* From <media/media-entity.h> on newer kernels (6.11) */
+/**
+ * media_entity_for_each_pad - Iterate on all pads in an entity
+ * @entity: The entity the pads belong to
+ * @iter: The iterator pad
+ *
+ * Iterate on all pads in a media entity.
+ */
+#define media_entity_for_each_pad(entity, iter)			\
+	for (iter = (entity)->pads;				\
+	     iter < &(entity)->pads[(entity)->num_pads];	\
+	     ++iter)
+
 
 #define DEFAULT_PACKET_LENGTH		(1 << 20)
 
@@ -144,6 +159,81 @@ static int verify_format(struct psee_dma *dma)
  * Pipeline Stream Management
  */
 
+
+/**
+ * start_stop_recursive - Recursive part of psee_pipeline_start_stop
+ * @entity: V4L2 sd to be started or stopped, with a recursion on its sources
+ * @start: Start (when true) or stop (when false) the pipeline
+ *
+ * if start, start this subdev
+ * then call recursively on each source entity (in depth traversal)
+ * then, if stop, stop this subdev
+ *
+ * Return: 0 if successful, ENODEV if a source is not a V4L2 subdev
+ * or the return value of the failed video::s_stream operation otherwise.
+ */
+static int start_stop_recursive(struct media_entity *entity, bool start)
+{
+	struct device *dev = entity->graph_obj.mdev->dev;
+	struct media_pad *pad, *remote;
+	struct v4l2_subdev *subdev = media_entity_to_v4l2_subdev(entity);
+	int ret;
+
+	dev_dbg(dev, "%s on %s", start ? "start" : "stop", entity->name);
+	/* When starting, start the receiver before the producer */
+	if (start) {
+		ret = v4l2_subdev_call(subdev, video, s_stream, start);
+		if (ret < 0 && ret != -ENOIOCTLCMD) {
+			dev_warn(dev, "s_stream %d on %s failed: %d",
+				start, subdev->name, ret);
+			return ret;
+		}
+	}
+
+	media_entity_for_each_pad(entity, pad) {
+		/* Looking for data sources, for which this entity in a sink */
+		if (!(pad->flags & MEDIA_PAD_FL_SINK)) {
+			dev_dbg(dev, "pad[%d] of %s is not a sink pad",
+				pad->index, entity->name);
+			continue;
+		}
+		/* Get the remote entity (it is assumed that ther is only one
+		 * active link for this pad
+		 */
+		remote = media_entity_remote_pad(pad);
+		if (!remote) {
+			dev_dbg(dev, "pad[%d] of %s has no active remote",
+				pad->index, entity->name);
+			continue;
+		}
+		/* A non-V4L2 subdev entity is not handled by this code */
+		if (!is_media_entity_v4l2_subdev(remote->entity)) {
+			dev_warn(dev, "%s is linked to %s, which is no v4l2 sd",
+				entity->name, remote->entity->name);
+			return -EIO;
+		}
+		/* Propagate the operation to sources */
+		ret = start_stop_recursive(remote->entity, start);
+		if (ret)
+			break;
+	}
+
+	/* When stopping, stop the receiver after the producer */
+	if (!start) {
+		ret = v4l2_subdev_call(subdev, video, s_stream, start);
+		if (ret < 0 && ret != -ENOIOCTLCMD) {
+			dev_warn(dev, "s_stream %d on %s failed: %d",
+				start, subdev->name, ret);
+		} else {
+			ret = 0;
+		}
+	}
+
+	dev_dbg(dev, "%s on %s returns %d",
+		start ? "start" : "stop", entity->name, ret);
+	return ret;
+}
+
 /**
  * psee_pipeline_start_stop - Start ot stop streaming on a pipeline
  * @pipe: The pipeline
@@ -152,36 +242,37 @@ static int verify_format(struct psee_dma *dma)
  * Walk the entities chain starting at the pipeline output video node and start
  * or stop all of them.
  *
- * Return: 0 if successful, or the return value of the failed video::s_stream
- * operation otherwise.
+ * The acquisition pipeline is expected to be a tree, with no cycle in the
+ * graph (only considering the active links). It uses a in-depth traversal,
+ * meaning that if one node makes the merge of two sources, one source will be
+ * started long before the other (possibly by hundreds of milliseconds, due to
+ * power-management and power supply bring-up).
+ * Usually, there is only one straight path from the pipeline output to the
+ * single data producer (the sensor), and this design is good-enough.
+ *
+ * For the stop procedure, since some blocks don't properly clear their internal
+ * memories between runs, this implementation stops sources before the entity
+ * sinking them, giving a few clock cycles with no input to flush the remaining
+ * data.
+ * From tree traversal point of view, this means building a stack of nodes to
+ * disable. This implementation directly uses the call stack, using the
+ * start_stop_recursive function.
+ *
+ * Return: 0 if successful, ENODEV if psee_dma somehow hasn't the expected
+ * layout, or the return value of start_stop_recursive otherwise.
  */
 static int psee_pipeline_start_stop(struct psee_pipeline *pipe, bool start)
 {
 	struct psee_dma *dma = pipe->output;
-	struct media_entity *entity;
 	struct media_pad *pad;
-	struct v4l2_subdev *subdev;
-	int ret;
 
-	entity = &dma->video.entity;
-	while (1) {
-		pad = &entity->pads[0];
-		if (!(pad->flags & MEDIA_PAD_FL_SINK))
-			break;
-
-		pad = media_entity_remote_pad(pad);
-		if (!pad || !is_media_entity_v4l2_subdev(pad->entity))
-			break;
-
-		entity = pad->entity;
-		subdev = media_entity_to_v4l2_subdev(entity);
-
-		ret = v4l2_subdev_call(subdev, video, s_stream, start);
-		if (start && ret < 0 && ret != -ENOIOCTLCMD)
-			return ret;
-	}
-
-	return 0;
+	/* The video device is handled in start_streaming, start operation on
+	 * the first remote entity
+	 */
+	pad = media_entity_remote_pad(&dma->pad);
+	if (!pad)
+		return -ENODEV;
+	return start_stop_recursive(pad->entity, start);
 }
 
 /**
